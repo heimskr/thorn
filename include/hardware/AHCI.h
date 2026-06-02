@@ -56,6 +56,7 @@ namespace Thorn::AHCI {
 
 	enum {
 		SCTL_PORT_DET_INIT 	 = 0x1,
+		SCTL_PORT_DET_MASK   = 0xf,
 		SCTL_PORT_IPM_NOPART = 0x100, // No partial state
 		SCTL_PORT_IPM_NOSLUM = 0x200, // No slumber state
 		SCTL_PORT_IPM_NODSLP = 0x400, // No devslp state
@@ -370,8 +371,8 @@ namespace Thorn::AHCI {
 			volatile HBAMemory *abar = nullptr;
 			volatile HBACommandHeader *commandList = nullptr;
 			volatile HBAFIS *fis = nullptr;
-			volatile HBACommandTable *commandTables[8];
-			void *physicalBuffers[8];
+			volatile HBACommandTable *commandTables[32];
+			void *physicalBuffers[32];
 			Status status = Status::Uninitialized;
 			DeviceType type = DeviceType::Null;
 

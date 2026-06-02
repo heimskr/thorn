@@ -62,7 +62,7 @@ namespace Thorn::AHCI {
 		// abar->ghc = abar->ghc | GHC_ENABLE;
 		// abar->ghc = abar->ghc | GHC_IE;
 
-		abar->ghc = abar->ghc | GHC_IE | GHC_ENABLE | GHC_HR;
+		abar->ghc = abar->ghc | GHC_IE | GHC_ENABLE;
 
 		printf("[AHCI::Controller::init] Enabled: %y (0x%x)\n", abar->ghc & GHC_ENABLE, abar->ghc);
 
@@ -131,8 +131,7 @@ namespace Thorn::AHCI {
 
 	void Port::identify(ATA::DeviceInfo &out) {
 		registers->ie = 0xffffffff;
-		registers->is = 0;
-		registers->tfd = 0;
+		registers->is = 0xffffffff;
 		int spin = 0;
 		int slot = getCommandSlot();
 		if (slot == -1) {
@@ -187,7 +186,7 @@ namespace Thorn::AHCI {
 		while ((registers->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin--)
 			Kernel::wait(1, 1000);
 
-		if (0 <= spin) {
+		if (spin < 0) {
 			printf("[Port::identify] Port hung\n");
 			return;
 		}
@@ -196,7 +195,6 @@ namespace Thorn::AHCI {
 		registers->ie = 0xffffffff;
 
 		start();
-		registers->sact = registers->sact | (1 << slot);
 		registers->ci = registers->ci | (1 << slot);
 
 		spin = SPIN_COUNT;
@@ -224,8 +222,6 @@ namespace Thorn::AHCI {
 	}
 
 	Port::Port(Controller *parent_, volatile HBAPort *port, volatile HBAMemory *memory): parent(parent_), registers(port), abar(memory) {
-		registers->cmd = registers->cmd & ~HBA_PxCMD_ST;
-		registers->cmd = registers->cmd & ~HBA_PxCMD_FRE;
 		stop();
 
 		if (!Kernel::instance) {
@@ -251,7 +247,7 @@ namespace Thorn::AHCI {
 		volatile auto memset_volatile = (void (* volatile)(volatile void *, int, size_t)) memset;
 
 		commandList = (HBACommandHeader *) getCLB();
-		memset_volatile(commandList, 0, sizeof(HBACommandHeader));
+		memset_volatile(commandList, 0, std::size(commandTables) * sizeof(HBACommandHeader));
 
 		fis = (HBAFIS *) getFB();
 		memset_volatile(fis, 0, sizeof(HBAFIS));
@@ -261,7 +257,7 @@ namespace Thorn::AHCI {
 		fis->rfis.type = FISType::RegD2H;
 		fis->sdbfis[0] = static_cast<uint8_t>(FISType::DevBits);
 
-		for (int i = 0; i < 8; ++i) {
+		for (int i = 0; i < std::size(commandTables); ++i) {
 			commandList[i].prdtl = 1;
 
 			addr = pager.allocateFreePhysicalAddress();
@@ -279,8 +275,8 @@ namespace Thorn::AHCI {
 		if (abar->cap & CAP_SALP)
 			registers->cmd = registers->cmd & ~HBA_PxCMD_ASP;
 
-		registers->is = 0;
-		registers->ie = 1;
+		registers->is = 0xffffffff;
+		registers->ie = 0xffffffff;
 		registers->fbs = registers->fbs & ~0xfffff000U;
 
 		registers->cmd = registers->cmd | HBA_PxCMD_POD;
@@ -293,14 +289,14 @@ namespace Thorn::AHCI {
 			while ((registers->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin--)
 				Kernel::wait(1, 1000);
 
-			if (spin <= 0) {
+			if (spin < 0) {
 				printf("[Port::Port] Port hung (%d)\n", __LINE__);
 				// Reset the port.
 				registers->sctl = SCTL_PORT_DET_INIT | SCTL_PORT_IPM_NOPART | SCTL_PORT_IPM_NOSLUM | SCTL_PORT_IPM_NODSLP;
 			}
 
 			Kernel::wait(1, 100);
-			registers->sctl = registers->sctl & ~HBA_PxSSTS_DET;
+			registers->sctl = registers->sctl & ~SCTL_PORT_DET_MASK;
 			Kernel::wait(1, 100);
 
 			spin = 200;
@@ -310,14 +306,14 @@ namespace Thorn::AHCI {
 			if ((registers->tfd & 0xff) == 0xff)
 				Kernel::wait(1, 2);
 
-			registers->serr = 0;
-			registers->is = 0;
+			registers->serr = 0xffffffff;
+			registers->is = 0xffffffff;
 
 			spin = SPIN_COUNT;
 			while ((registers->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin--)
 				Kernel::wait(1, 1000);
 
-			if (spin <= 0)
+			if (spin < 0)
 				printf("[Port::Port] Port hung (%d)\n", __LINE__);
 		}
 
@@ -330,7 +326,7 @@ namespace Thorn::AHCI {
 
 		pager_lock.lock();
 
-		for (unsigned i = 0; i < 8; ++i) {
+		for (unsigned i = 0; i < 32; ++i) {
 			uintptr_t addr = pager.allocateFreePhysicalAddress();
 			physicalBuffers[i] = (void *) addr;
 			pager.identityMap(wrapper, addr);
@@ -372,7 +368,7 @@ namespace Thorn::AHCI {
 		printf("tfd after cmds:  %u / %b\n", registers->tfd, registers->tfd);
 		// cmd = cmd & ~0xc009;
 		registers->serr = 0xffff;
-		registers->is = 0;
+		registers->is = 0xffffffff;
 
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
 
@@ -403,21 +399,15 @@ namespace Thorn::AHCI {
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
 
 		HBACommandHeader *header = (HBACommandHeader *) getCLB();
-		addr = pager.allocateFreePhysicalAddress();
-		pager.identityMap(wrapper, addr, MMU_CACHE_DISABLED);
-		uintptr_t base = reinterpret_cast<uintptr_t>(addr);
-
-		for (int i = 0; i < 16; ++i) {
-			header[i].prdtl = 8;
-			header[i].setCTBA((void *) (base + i * 256));
-			memset(header[i].getCTBA(), 0, 256);
-		}
+		// addr = pager.allocateFreePhysicalAddress();
+		// pager.identityMap(wrapper, addr, MMU_CACHE_DISABLED);
+		// uintptr_t base = reinterpret_cast<uintptr_t>(addr);
 
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
 
 		addr = pager.allocateFreePhysicalAddress();
 		pager.identityMap(wrapper, addr, MMU_CACHE_DISABLED);
-		base = (uintptr_t) addr;
+		uintptr_t base = (uintptr_t) addr;
 		printf("CTBA base: 0x%lx\n", base);
 
 		for (int i = 0; i < 16; ++i) {
@@ -429,7 +419,7 @@ namespace Thorn::AHCI {
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
 		start();
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
-		registers->is = 0;
+		registers->is = 0xffffffff;
 		registers->ie = 0;
 		printf("[%s:%d] tfd: %u / %b\n", __FILE__, __LINE__, registers->tfd, registers->tfd);
 	}
@@ -437,7 +427,7 @@ namespace Thorn::AHCI {
 	void Port::start() {
 		registers->cmd = registers->cmd | HBA_PxCMD_FRE;
 		registers->cmd = registers->cmd | HBA_PxCMD_ST;
-		registers->is = 0; // ?
+		registers->is = 0xffffffff; // ?
 	}
 
 	void Port::stop() {
@@ -450,10 +440,8 @@ namespace Thorn::AHCI {
 			Kernel::wait(1, 1000);
 		}
 
-		if (spin <= 0)
+		if (spin < 0)
 			printf("[Port::stop] Port hung\n");
-
-		registers->cmd = registers->cmd & ~HBA_PxCMD_FRE;
 	}
 
 	void Port::setCLB(uintptr_t address) {
@@ -476,7 +464,7 @@ namespace Thorn::AHCI {
 
 	Port::AccessStatus Port::access(uint64_t lba, uint32_t count, void *buffer, bool write) {
 		registers->ie = 0xffffffff;
-		registers->is = 0;
+		registers->is = 0xffffffff;
 
 		int slot = getCommandSlot();
 		if (slot == -1) {
@@ -484,8 +472,7 @@ namespace Thorn::AHCI {
 			return AccessStatus::BadSlot;
 		}
 
-		registers->serr = 0;
-		registers->tfd = 0;
+		registers->serr = 0xffffffff;
 
 		volatile HBACommandHeader &header = commandList[slot];
 		header.cfl = sizeof(FISRegH2D) / sizeof(uint32_t);
@@ -529,7 +516,7 @@ namespace Thorn::AHCI {
 		while ((registers->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin--)
 			Kernel::wait(1, 1000);
 
-		if (spin <= 0) {
+		if (spin < 0) {
 			printf("[Port::access] Port is hung\n");
 			return AccessStatus::Hung;
 		}
@@ -551,7 +538,7 @@ namespace Thorn::AHCI {
 			Kernel::wait(1, 1000);
 		}
 
-		if (spin <= 0) {
+		if (spin < 0) {
 			printf("[Port::access] Port is hung\n");
 			return AccessStatus::Hung;
 		}
@@ -562,7 +549,7 @@ namespace Thorn::AHCI {
 
 		stop();
 
-		if (spin <= 0) {
+		if (spin < 0) {
 			printf("[Port::access] Port hung\n");
 			return AccessStatus::Hung;
 		}
@@ -585,8 +572,8 @@ namespace Thorn::AHCI {
 			unsigned size = BLOCKSIZE * 8;
 			if (count < size)
 				size = count;
-			if (access(lba, 8, physicalBuffers[buffer_index], false) != AccessStatus::Success)
-				return AccessStatus::DiskError;
+			if (auto result = access(lba, 8, physicalBuffers[buffer_index], false); result != AccessStatus::Success)
+				return result;
 			memcpy(cbuffer, physicalBuffers[buffer_index], size);
 			cbuffer += size;
 			lba += 8;
@@ -598,8 +585,8 @@ namespace Thorn::AHCI {
 			unsigned size = BLOCKSIZE * 2;
 			if (count < size)
 				size = count;
-			if (access(lba, 2, physicalBuffers[buffer_index], false) != AccessStatus::Success)
-				return AccessStatus::DiskError;
+			if (auto result = access(lba, 2, physicalBuffers[buffer_index], false); result != AccessStatus::Success)
+				return result;
 			memcpy(cbuffer, physicalBuffers[buffer_index], size);
 			cbuffer += size;
 			lba += 2;
@@ -611,8 +598,8 @@ namespace Thorn::AHCI {
 			unsigned size = BLOCKSIZE;
 			if (count < size)
 				size = count;
-			if (access(lba, 1, physicalBuffers[buffer_index], false) != AccessStatus::Success)
-				return AccessStatus::DiskError;
+			if (auto result = access(lba, 1, physicalBuffers[buffer_index], false); result != AccessStatus::Success)
+				return result;
 			memcpy(cbuffer, physicalBuffers[buffer_index], size);
 			cbuffer += size;
 			++lba;
@@ -696,7 +683,7 @@ namespace Thorn::AHCI {
 					return status;
 				break;
 			} else {
-				if ((status = write(lba, BLOCKSIZE, write_buffer)) != AccessStatus::Success)
+				if ((status = write(lba, BLOCKSIZE, cbuffer)) != AccessStatus::Success)
 					return status;
 				count -= BLOCKSIZE;
 				cbuffer += BLOCKSIZE;
